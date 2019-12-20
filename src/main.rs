@@ -17,29 +17,30 @@ extern crate alloc;
 #[macro_use]
 extern crate log;
 
+#[cfg(target_arch = "aarch64")]
+use aarch64::{
+    paging::{FrameAllocator, PhysFrame, Size4KiB},
+    PhysAddr,
+};
 use alloc::boxed::Box;
 use rboot::{BootInfo, GraphicInfo, MemoryMap};
-use uefi::prelude::*;
-use uefi::proto::console::gop::GraphicsOutput;
-use uefi::proto::media::file::*;
-use uefi::proto::media::fs::SimpleFileSystem;
-use uefi::proto::pi::mp::MPServices;
-use uefi::table::boot::*;
-use uefi::table::cfg::ACPI2_GUID;
+use uefi::{
+    prelude::*,
+    proto::{
+        console::gop::GraphicsOutput, media::file::*, media::fs::SimpleFileSystem,
+        pi::mp::MPServices,
+    },
+    table::{boot::*, cfg::ACPI2_GUID},
+};
 #[cfg(target_arch = "x86_64")]
-use x86_64::registers::control::*;
-#[cfg(target_arch = "x86_64")]
-use x86_64::structures::paging::*;
-#[cfg(target_arch = "x86_64")]
-use x86_64::{PhysAddr, VirtAddr};
-#[cfg(target_arch = "aarch64")]
-use aarch64::paging::{FrameAllocator, PhysFrame, Size4KiB};
-#[cfg(target_arch = "aarch64")]
-use aarch64::PhysAddr;
+use x86_64::{
+    registers::control::{Cr0, Cr0Flags, Efer, EferFlags},
+    structures::paging::{FrameAllocator, PhysFrame, Size4KiB, UnusedPhysFrame},
+    PhysAddr,
+};
 use xmas_elf::ElfFile;
 
 mod config;
-#[cfg(target_arch = "x86_64")]
 mod page_table;
 
 const CONFIG_PATH: &str = "\\EFI\\Boot\\rboot.conf";
@@ -85,14 +86,13 @@ fn efi_main(image: uefi::Handle, st: SystemTable<Boot>) -> Status {
         .memory_map(mmap_storage)
         .expect_success("failed to get memory map")
         .1;
-    let _max_phys_addr = mmap_iter
+    let max_phys_addr = mmap_iter
         .map(|m| m.phys_start + m.page_count * 0x1000)
         .max()
         .unwrap()
         .max(0x100000000); // include IOAPIC MMIO area
 
-    #[cfg(target_arch = "x86_64")]
-    let mut page_table = current_page_table();
+    let mut page_table = page_table::current_page_table();
     // root page table is readonly
     // disable write protect
     #[cfg(target_arch = "x86_64")]
@@ -100,7 +100,6 @@ fn efi_main(image: uefi::Handle, st: SystemTable<Boot>) -> Status {
         Cr0::update(|f| f.remove(Cr0Flags::WRITE_PROTECT));
         Efer::update(|f| f.insert(EferFlags::NO_EXECUTE_ENABLE));
     }
-    #[cfg(target_arch = "x86_64")]
     page_table::map_elf(&elf, &mut page_table, &mut UEFIFrameAllocator(bs))
         .expect("failed to map ELF");
     // we use UEFI default stack, no need to allocate
@@ -111,7 +110,6 @@ fn efi_main(image: uefi::Handle, st: SystemTable<Boot>) -> Status {
     //        &mut UEFIFrameAllocator(bs),
     //    )
     //    .expect("failed to map stack");
-    #[cfg(target_arch = "x86_64")]
     page_table::map_physical_memory(
         config.physical_memory_offset,
         max_phys_addr,
@@ -124,6 +122,7 @@ fn efi_main(image: uefi::Handle, st: SystemTable<Boot>) -> Status {
         Cr0::update(|f| f.insert(Cr0Flags::WRITE_PROTECT));
     }
 
+    #[cfg(target_arch = "x86_64")]
     start_aps(bs);
 
     info!("exit boot services");
@@ -182,11 +181,11 @@ fn load_file(bs: &BootServices, file: &mut RegularFile) -> &'static mut [u8] {
 
 /// If `resolution` is some, then set graphic mode matching the resolution.
 /// Return information of the final graphic mode.
-fn init_graphic(bs: &BootServices, resolution: Option<(usize, usize)>) -> GraphicInfo {
-    let gop = bs
-        .locate_protocol::<GraphicsOutput>()
-        .expect_success("failed to get GraphicsOutput");
-    let gop = unsafe { &mut *gop.get() };
+fn init_graphic(bs: &BootServices, resolution: Option<(usize, usize)>) -> Option<GraphicInfo> {
+    let gop = match bs.locate_protocol::<GraphicsOutput>().warning_as_error() {
+        Ok(gop) => unsafe { &mut *gop.get() },
+        Err(_) => return None,
+    };
 
     if let Some(resolution) = resolution {
         let mode = gop
@@ -201,19 +200,11 @@ fn init_graphic(bs: &BootServices, resolution: Option<(usize, usize)>) -> Graphi
         gop.set_mode(&mode)
             .expect_success("Failed to set graphics mode");
     }
-    GraphicInfo {
+    Some(GraphicInfo {
         mode: gop.current_mode_info(),
         fb_addr: gop.frame_buffer().as_mut_ptr() as u64,
         fb_size: gop.frame_buffer().size() as u64,
-    }
-}
-
-/// Get current page table from CR3
-#[cfg(target_arch = "x86_64")]
-fn current_page_table() -> OffsetPageTable<'static> {
-    let p4_table_addr = Cr3::read().0.start_address().as_u64();
-    let p4_table = unsafe { &mut *(p4_table_addr as *mut PageTable) };
-    unsafe { OffsetPageTable::new(p4_table, VirtAddr::new(0)) }
+    })
 }
 
 /// Use `BootServices::allocate_pages()` as frame allocator
@@ -245,6 +236,7 @@ unsafe impl FrameAllocator<Size4KiB> for UEFIFrameAllocator<'_> {
 }
 
 /// Startup all application processors
+#[allow(dead_code)]
 fn start_aps(bs: &BootServices) {
     info!("starting application processors");
     let mp = bs
@@ -290,23 +282,26 @@ fn start_aps(bs: &BootServices) {
 }
 
 /// Main function for application processors
+#[allow(dead_code)]
 extern "efiapi" fn ap_main(_arg: *mut core::ffi::c_void) {
     jump_to_entry(core::ptr::null());
 }
 
 /// Jump to ELF entry according to global variable `ENTRY`
-fn jump_to_entry(_bootinfo: *const BootInfo) -> ! {
+fn jump_to_entry(bootinfo: *const BootInfo) -> ! {
     // HACK: why this way causes wrong argument?
     //
     // let entry: KernelEntry = unsafe { core::mem::transmute(ENTRY) };
     // entry(bootinfo);
-    #[cfg(target_arch = "x86_64")]
     unsafe {
         // TODO: Setup stack pointer safely
         //       Now rsp is pointing to physical mapping area without guard page.
+        #[cfg(target_arch = "x86_64")]
         asm!("add rsp, $0; jmp $1"
             :: "m"(PHYSICAL_MEMORY_OFFSET), "r"(ENTRY), "{rdi}"(bootinfo)
             :: "intel");
+        #[cfg(target_arch = "aarch64")]
+        asm!("" :: "r"(bootinfo));
     }
     unreachable!()
 }
