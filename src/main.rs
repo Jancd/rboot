@@ -26,12 +26,20 @@ use uefi::proto::media::fs::SimpleFileSystem;
 use uefi::proto::pi::mp::MPServices;
 use uefi::table::boot::*;
 use uefi::table::cfg::ACPI2_GUID;
+#[cfg(target_arch = "x86_64")]
 use x86_64::registers::control::*;
+#[cfg(target_arch = "x86_64")]
 use x86_64::structures::paging::*;
+#[cfg(target_arch = "x86_64")]
 use x86_64::{PhysAddr, VirtAddr};
+#[cfg(target_arch = "aarch64")]
+use aarch64::paging::{FrameAllocator, PhysFrame, Size4KiB};
+#[cfg(target_arch = "aarch64")]
+use aarch64::PhysAddr;
 use xmas_elf::ElfFile;
 
 mod config;
+#[cfg(target_arch = "x86_64")]
 mod page_table;
 
 const CONFIG_PATH: &str = "\\EFI\\Boot\\rboot.conf";
@@ -77,19 +85,22 @@ fn efi_main(image: uefi::Handle, st: SystemTable<Boot>) -> Status {
         .memory_map(mmap_storage)
         .expect_success("failed to get memory map")
         .1;
-    let max_phys_addr = mmap_iter
+    let _max_phys_addr = mmap_iter
         .map(|m| m.phys_start + m.page_count * 0x1000)
         .max()
         .unwrap()
         .max(0x100000000); // include IOAPIC MMIO area
 
+    #[cfg(target_arch = "x86_64")]
     let mut page_table = current_page_table();
     // root page table is readonly
     // disable write protect
+    #[cfg(target_arch = "x86_64")]
     unsafe {
         Cr0::update(|f| f.remove(Cr0Flags::WRITE_PROTECT));
         Efer::update(|f| f.insert(EferFlags::NO_EXECUTE_ENABLE));
     }
+    #[cfg(target_arch = "x86_64")]
     page_table::map_elf(&elf, &mut page_table, &mut UEFIFrameAllocator(bs))
         .expect("failed to map ELF");
     // we use UEFI default stack, no need to allocate
@@ -100,6 +111,7 @@ fn efi_main(image: uefi::Handle, st: SystemTable<Boot>) -> Status {
     //        &mut UEFIFrameAllocator(bs),
     //    )
     //    .expect("failed to map stack");
+    #[cfg(target_arch = "x86_64")]
     page_table::map_physical_memory(
         config.physical_memory_offset,
         max_phys_addr,
@@ -107,6 +119,7 @@ fn efi_main(image: uefi::Handle, st: SystemTable<Boot>) -> Status {
         &mut UEFIFrameAllocator(bs),
     );
     // recover write protect
+    #[cfg(target_arch = "x86_64")]
     unsafe {
         Cr0::update(|f| f.insert(Cr0Flags::WRITE_PROTECT));
     }
@@ -196,6 +209,7 @@ fn init_graphic(bs: &BootServices, resolution: Option<(usize, usize)>) -> Graphi
 }
 
 /// Get current page table from CR3
+#[cfg(target_arch = "x86_64")]
 fn current_page_table() -> OffsetPageTable<'static> {
     let p4_table_addr = Cr3::read().0.start_address().as_u64();
     let p4_table = unsafe { &mut *(p4_table_addr as *mut PageTable) };
@@ -205,6 +219,7 @@ fn current_page_table() -> OffsetPageTable<'static> {
 /// Use `BootServices::allocate_pages()` as frame allocator
 struct UEFIFrameAllocator<'a>(&'a BootServices);
 
+#[cfg(target_arch = "x86_64")]
 unsafe impl FrameAllocator<Size4KiB> for UEFIFrameAllocator<'_> {
     fn allocate_frame(&mut self) -> Option<UnusedPhysFrame> {
         let addr = self
@@ -213,6 +228,18 @@ unsafe impl FrameAllocator<Size4KiB> for UEFIFrameAllocator<'_> {
             .expect_success("failed to allocate frame");
         let frame =
             unsafe { UnusedPhysFrame::new(PhysFrame::containing_address(PhysAddr::new(addr))) };
+        Some(frame)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe impl FrameAllocator<Size4KiB> for UEFIFrameAllocator<'_> {
+    fn allocate_frame(&mut self) -> Option<PhysFrame> {
+        let addr = self
+            .0
+            .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
+            .expect_success("failed to allocate frame");
+        let frame = PhysFrame::containing_address(PhysAddr::new(addr));
         Some(frame)
     }
 }
@@ -268,11 +295,12 @@ extern "efiapi" fn ap_main(_arg: *mut core::ffi::c_void) {
 }
 
 /// Jump to ELF entry according to global variable `ENTRY`
-fn jump_to_entry(bootinfo: *const BootInfo) -> ! {
+fn jump_to_entry(_bootinfo: *const BootInfo) -> ! {
     // HACK: why this way causes wrong argument?
     //
     // let entry: KernelEntry = unsafe { core::mem::transmute(ENTRY) };
     // entry(bootinfo);
+    #[cfg(target_arch = "x86_64")]
     unsafe {
         // TODO: Setup stack pointer safely
         //       Now rsp is pointing to physical mapping area without guard page.

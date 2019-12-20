@@ -8,6 +8,11 @@ os:
   - linux
   - osx
 
+env:
+  matrix:
+    - ARCH="x86_64"
+    - ARCH="aarch64"
+
 before_script:
   - rustup component add rust-src
 
