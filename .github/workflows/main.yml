@@ -6,12 +6,14 @@ jobs:
   build:
 
     runs-on: ubuntu-latest
-
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64]
     steps:
     - uses: actions/checkout@v2
     - name: Build
       run: |
         rustup component add rust-src
-        make build
+        make build ARCH=${{ matrix.arch }}
     - name: Build docs
-      run: make doc
+      run: make doc ARCH=${{ matrix.arch }}
